@@ -8,12 +8,22 @@ Showcases:
 - Provider-agnostic model instantiation
 """
 
+import inspect
+import json
 import os
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
-from pydantic_ai import Agent
+from pydantic_ai import (
+    Agent,
+    FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    TextPartDelta,
+)
+from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -21,9 +31,8 @@ from pydantic_ai.messages import (
     TextPart,
 )
 
-from .models import OutputCategory, OutputData
+from .models import OutputCategory, OutputData, ToolStatus, ToolStepInfo
 
-# Type variables for generic agent
 OutputType = TypeVar("OutputType")
 DepsType = TypeVar("DepsType")
 
@@ -100,6 +109,7 @@ class BaseAgent(Generic[OutputType, DepsType]):
         self.model = model
         self.tools = tools or []
         self.retries = retries
+        self.has_structured_output = output_type is not None
 
         # Setup instrumentation if requested
         if instrument:
@@ -137,7 +147,7 @@ class BaseAgent(Generic[OutputType, DepsType]):
         message_history: list[ModelMessage] | None = None,
     ) -> OutputType:
         """
-        Run the agent without streaming.
+        Run the agent WITHOUT STREAMING.
 
         Showcases:
         - Simple non-streaming execution
@@ -165,41 +175,168 @@ class BaseAgent(Generic[OutputType, DepsType]):
         message_history: list[ModelMessage] | None = None,
     ) -> AsyncIterator[OutputData]:
         """
-        Stream agent response with tool execution events.
+        Stream the agent graph (LLM tokens + tool calls) as OutputData events.
 
         Showcases:
-        - Streaming protocol with OutputData events
-        - Text streaming with stream_text()
-        - Chat history on final_result for persistence
+        - `Agent.iter()` node handling for MODEL_REQUEST / CALL_TOOLS / FINAL_RESULT
+        - Structured-output shortcut: falls back to run() when `output_type` is set
+        - Tool call lifecycle (STARTED, STREAMING, FINISHED, RETRY, ERROR) via ToolStepInfo
+        - Chat history persistence on FINAL_RESULT so multi-turn chains stay in sync
 
         Yields:
             OutputData events as the agent processes the request
         """
-        async with self._agent.run_stream(
-            prompt,
-            deps=deps,
-            message_history=message_history,
-        ) as result:
-            # Track accumulated text
-            accumulated_text = ""
+        # For structured output (Level 1), use run() instead of streaming
+        # since streaming works better with text responses
+        if self.has_structured_output:
+            result = await self._agent.run(
+                prompt,
+                deps=deps,
+                message_history=message_history,
+            )
+            # Convert structured output to formatted string for display
+            if hasattr(result.output, "model_dump_json"):
+                output_text = result.output.model_dump_json(indent=2)
+            else:
+                output_text = str(result.output)
 
-            # Stream text deltas
-            async for text_delta in result.stream_text(delta=True):
-                accumulated_text += text_delta
-                yield OutputData(
-                    output_message=text_delta,
-                    category=OutputCategory.MODEL_REQUEST,
-                )
+            # Yield the complete result as a single message
+            yield OutputData(
+                output_message=output_text,
+                category=OutputCategory.MODEL_REQUEST,
+            )
 
             # Final result with chat history
-            # Showcases: Chat history for multi-turn conversation persistence
             chat_history = self._messages_to_dict(result.all_messages())
-
             yield OutputData(
-                output_message=accumulated_text,
+                output_message=output_text,
                 category=OutputCategory.FINAL_RESULT,
                 chat_history=chat_history,
             )
+            return
+
+        accumulated_text = ""
+        active_tool_calls: dict[str, ToolStepInfo] = {}
+
+        try:
+            async with self._agent.iter(
+                prompt,
+                deps=deps,
+                message_history=message_history,
+            ) as agent_run:
+                async for node in agent_run:
+                    if isinstance(node, ModelRequestNode):
+                        async with node.stream(agent_run.ctx) as agent_stream:
+                            final_result_started = False
+
+                            async for stream_event in agent_stream:
+                                if isinstance(stream_event, PartDeltaEvent) and isinstance(
+                                    stream_event.delta, TextPartDelta
+                                ):
+                                    text_delta = stream_event.delta.content_delta
+                                    accumulated_text += text_delta
+                                    yield OutputData(
+                                        output_message=text_delta,
+                                        category=OutputCategory.MODEL_REQUEST,
+                                    )
+                                elif isinstance(stream_event, FinalResultEvent):
+                                    final_result_started = True
+                                    break
+
+                            if final_result_started:
+                                async for text_delta in agent_stream.stream_text(delta=True):
+                                    accumulated_text += text_delta
+                                    yield OutputData(
+                                        output_message=text_delta,
+                                        category=OutputCategory.MODEL_REQUEST,
+                                    )
+                    elif isinstance(node, CallToolsNode):
+                        async with node.stream(agent_run.ctx) as tool_events:
+                            async for tool_event in tool_events:
+                                if isinstance(tool_event, FunctionToolCallEvent):
+                                    tool_name = tool_event.part.tool_name
+                                    tool_call_id = tool_event.part.tool_call_id
+                                    tool_args = self._normalize_tool_args(tool_event.part.args)
+
+                                    tool_step = ToolStepInfo(
+                                        tool_name=tool_name,
+                                        tool_call_id=tool_call_id,
+                                        args=tool_args,
+                                        status=ToolStatus.STARTED,
+                                    )
+                                    active_tool_calls[tool_call_id] = tool_step
+
+                                    yield OutputData(
+                                        output_message="",
+                                        category=OutputCategory.CALL_TOOLS,
+                                        tool_step_info=tool_step,
+                                    )
+                                elif isinstance(tool_event, FunctionToolResultEvent):
+                                    tool_call_id = tool_event.tool_call_id
+
+                                    if tool_call_id in active_tool_calls:
+                                        tool_step = active_tool_calls[tool_call_id]
+                                        result_content = self._get_tool_result_content(
+                                            tool_event.result
+                                        )
+
+                                        if self._is_async_iterable(result_content):
+                                            final_content = ""
+                                            async for chunk in result_content:
+                                                chunk_text = str(chunk)
+                                                final_content += chunk_text
+
+                                                yield OutputData(
+                                                    output_message="",
+                                                    category=OutputCategory.CALL_TOOLS,
+                                                    tool_step_info=ToolStepInfo(
+                                                        tool_name=tool_step.tool_name,
+                                                        tool_call_id=tool_step.tool_call_id,
+                                                        args=tool_step.args,
+                                                        status=ToolStatus.STREAMING,
+                                                        result=chunk_text,
+                                                    ),
+                                                )
+
+                                            if hasattr(tool_event.result, "content"):
+                                                tool_event.result.content = final_content
+
+                                            tool_step.result = final_content
+                                        else:
+                                            tool_step.result = result_content
+
+                                        tool_step.status = ToolStatus.FINISHED
+
+                                        yield OutputData(
+                                            output_message="",
+                                            category=OutputCategory.CALL_TOOLS,
+                                            tool_step_info=tool_step,
+                                        )
+
+                                        active_tool_calls.pop(tool_call_id, None)
+
+                final_result = agent_run.result
+                if final_result is None:
+                    return
+
+                chat_history = self._messages_to_dict(final_result.all_messages())
+                final_output = final_result.output
+                if hasattr(final_output, "model_dump_json"):
+                    output_text = final_output.model_dump_json(indent=2)
+                else:
+                    output_text = str(final_output)
+
+                if not accumulated_text:
+                    accumulated_text = output_text
+
+                yield OutputData(
+                    output_message=accumulated_text,
+                    category=OutputCategory.FINAL_RESULT,
+                    chat_history=chat_history,
+                )
+        except GeneratorExit:
+            # Client disconnected, stop iteration gracefully
+            return
 
     async def reply_deterministic(
         self,
@@ -241,6 +378,42 @@ class BaseAgent(Generic[OutputType, DepsType]):
                 }
             ],
         )
+
+    def _normalize_tool_args(self, args: Any) -> dict[str, Any]:
+        """Ensure tool arguments are represented as a dictionary."""
+        if args is None:
+            return {}
+
+        if isinstance(args, dict):
+            return args
+
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+            except json.JSONDecodeError:
+                return {"value": args}
+
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+
+        if hasattr(args, "model_dump"):
+            return args.model_dump()
+
+        if hasattr(args, "__dict__"):
+            return {key: value for key, value in vars(args).items() if not key.startswith("_")}
+
+        return {"value": args}
+
+    def _get_tool_result_content(self, result: Any) -> Any:
+        """Extract the tool result payload, preferring `content` if present."""
+        if hasattr(result, "content"):
+            return result.content
+        return result
+
+    def _is_async_iterable(self, value: Any) -> bool:
+        """Return True if value can be iterated asynchronously."""
+        return inspect.isasyncgen(value) or isinstance(value, AsyncIterator)
 
     def _messages_to_dict(self, messages: list[ModelMessage]) -> list[dict]:
         """Convert pydantic-ai messages to serializable dicts."""

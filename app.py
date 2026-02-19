@@ -14,6 +14,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import chainlit as cl
+from chainlit import ChatSettings
+from chainlit.input_widget import Switch
 from dotenv import load_dotenv
 
 from agent.agent import SQLQueryAgent
@@ -48,6 +50,21 @@ async def on_chat_start():
     cl.user_session.set("agent", agent)
     cl.user_session.set("deps", deps)
     cl.user_session.set("message_history", [])
+    settings = await ChatSettings(
+        inputs=[
+            Switch(
+                id="stream_tool_output",
+                label="Embed tool output in assistant stream",
+                initial=False,
+                description="When enabled, tool responses are merged into the assistant's streamed reply.",
+            )
+        ]
+    ).send()
+    cl.user_session.set("chat_settings", settings)
+    cl.user_session.set(
+        "stream_tool_output",
+        settings.get("stream_tool_output", False),
+    )
 
     # Send welcome message
     welcome = agent.get_welcome_message()
@@ -77,6 +94,7 @@ async def on_message(message: cl.Message):
     agent: SQLQueryAgent = cl.user_session.get("agent")
     deps: SQLAgentDeps = cl.user_session.get("deps")
     message_history = cl.user_session.get("message_history", [])
+    stream_tool_output = cl.user_session.get("stream_tool_output", False)
 
     # Create response message for streaming
     response_msg = cl.Message(content="")
@@ -84,6 +102,7 @@ async def on_message(message: cl.Message):
 
     # Track active tool steps for proper nesting
     active_steps: dict[str, cl.Step] = {}
+    inline_tool_meta: dict[str, dict[str, bool]] = {}
 
     try:
         # Stream agent response
@@ -113,9 +132,22 @@ async def on_message(message: cl.Message):
                     await step.send()
                     active_steps[tool_name] = step
 
+                    # Stream tool execution start
+                    await response_msg.stream_token(f"\n\n🔧 **Calling {tool_name}**")
+
                     # Show what the tool is doing
                     if tool_info.tool_representation:
                         step.output = f"⏳ {tool_info.tool_representation}"
+                        await step.update()
+                        await response_msg.stream_token(f"\n⏳ {tool_info.tool_representation}")
+
+                elif tool_info.status == ToolStatus.STREAMING:
+                    # Incrementally append tool output while it runs
+                    chunk = str(tool_info.result or "")
+                    step = active_steps.get(tool_name)
+                    if step:
+                        existing_output = step.output or ""
+                        step.output = f"{existing_output}{chunk}"
                         await step.update()
 
                 elif tool_info.status == ToolStatus.FINISHED:
@@ -124,6 +156,10 @@ async def on_message(message: cl.Message):
                     if step:
                         step.output = format_tool_output(tool_info.result)
                         await step.update()
+                    active_steps.pop(tool_name, None)
+
+                    # Stream completion
+                    await response_msg.stream_token(f"\n✅ {tool_name} completed")
 
                 elif tool_info.status == ToolStatus.RETRY:
                     # Showcases: ModelRetry visualization
@@ -134,11 +170,19 @@ async def on_message(message: cl.Message):
                         step.output = retry_msg
                         await step.update()
 
+                    # Stream retry message
+                    await response_msg.stream_token(
+                        f"\n🔄 Retry requested: {tool_info.error or 'Retrying...'}"
+                    )
+
                 elif tool_info.status == ToolStatus.ERROR:
                     step = active_steps.get(tool_name)
                     if step:
                         step.output = f"❌ Error: {tool_info.error}"
                         await step.update()
+
+                    # Stream error
+                    await response_msg.stream_token(f"\n❌ {tool_name} error: {tool_info.error}")
 
             elif event.category == OutputCategory.FINAL_RESULT:
                 # Update message history for multi-turn

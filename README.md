@@ -2,6 +2,8 @@
 
 A standalone demonstration of building AI agents with **pydantic-ai**, designed for teaching core concepts progressively.
 
+Python version: 3.12
+
 ## Quick Start
 
 ```bash
@@ -58,14 +60,6 @@ sql_agent_showcase/
 └── Makefile           # Quick commands
 ```
 
-## Key pydantic-ai Features Demonstrated
-
-1. **Dependency Injection** - `RunContext[SQLAgentDeps]` in tools
-2. **Dynamic Prompts** - `instructions` callables vs static `system_prompt`
-3. **Structured Output** - `output_type=StructuredQueryPlan`
-4. **ModelRetry** - Error recovery with LLM self-correction
-5. **Streaming** - `OutputData` protocol with tool visualization
-6. **Observability** - Langfuse integration via logfire
 
 ## Try These Demos
 
@@ -110,11 +104,7 @@ ENABLE_LANGFUSE=false
 
 ## Documentation
 
-See [agent.md](agent.md) for comprehensive documentation including:
-- Architecture diagrams
-- Code walkthrough with "what to point out"
-- Pydantic-AI features mapping
-- Production comparison with Hugo agent
+See [agent.md](agent.md) for comprehensive documentation.
 
 ## License
 

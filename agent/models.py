@@ -124,6 +124,7 @@ class ToolStatus(str, Enum):
     """Status of a tool execution."""
 
     STARTED = "started"
+    STREAMING = "streaming"
     FINISHED = "finished"
     RETRY = "retry"
     ERROR = "error"
@@ -137,6 +138,9 @@ class ToolStepInfo(BaseModel):
     """
 
     tool_name: str = Field(description="Name of the tool being executed")
+    tool_call_id: str | None = Field(
+        default=None, description="Unique identifier for the tool call"
+    )
     args: dict[str, Any] = Field(default_factory=dict, description="Arguments passed to the tool")
     status: ToolStatus = Field(description="Current status of the tool execution")
     result: Any = Field(default=None, description="Tool result (when finished)")
