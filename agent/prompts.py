@@ -7,6 +7,8 @@ Showcases:
 - Keeping data and instructions co-located for better LLM comprehension
 """
 
+import os
+
 from pydantic_ai import RunContext
 
 from .deps import SQLAgentDeps
@@ -70,12 +72,17 @@ def get_schema_context(ctx: RunContext[SQLAgentDeps]) -> str:
     """
     deps = ctx.deps
 
+
     if not deps.schema_cache:
         return """
 <schema_context>
 No schema information loaded yet. Use list_tables and describe_table to explore.
 </schema_context>
 """
+    if os.getenv("DEMO_LEVEL") == "2":
+        cached_tables = ", ".join(sorted(deps.schema_cache.keys())) or "none"
+        print(f"🧭 [level2] get_schema_context() called; cached tables: {cached_tables}")
+
 
     # Build schema summary from cache
     schema_lines = ["<schema_context>", "Tables you have explored:"]

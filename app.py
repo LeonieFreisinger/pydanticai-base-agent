@@ -95,6 +95,7 @@ async def on_message(message: cl.Message):
     deps: SQLAgentDeps = cl.user_session.get("deps")
     message_history = cl.user_session.get("message_history", [])
     stream_tool_output = cl.user_session.get("stream_tool_output", False)
+    structured_output = bool(getattr(agent, "config", {}).get("structured_output"))
 
     # Create response message for streaming
     response_msg = cl.Message(content="")
@@ -104,6 +105,8 @@ async def on_message(message: cl.Message):
     active_steps: dict[str, cl.Step] = {}
     inline_tool_meta: dict[str, dict[str, bool]] = {}
 
+    structured_rendered = False
+
     try:
         # Stream agent response
         async for event in agent.stream(
@@ -112,8 +115,13 @@ async def on_message(message: cl.Message):
             message_history=message_history if message_history else None,
         ):
             if event.category == OutputCategory.MODEL_REQUEST:
-                # Stream text tokens
-                await response_msg.stream_token(event.output_message)
+                if structured_output and not structured_rendered:
+                    response_msg.content = f"```json\n{event.output_message}\n```"
+                    await response_msg.update()
+                    structured_rendered = True
+                else:
+                    # Stream text tokens
+                    await response_msg.stream_token(event.output_message)
 
             elif event.category == OutputCategory.CALL_TOOLS:
                 tool_info = event.tool_step_info

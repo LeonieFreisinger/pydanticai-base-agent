@@ -13,6 +13,7 @@ that the LLM sees. Write them clearly and include all relevant context.
 """
 
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -154,6 +155,9 @@ async def describe_table(
     # Cache in deps for future use
     # Showcases: Deps mutation - state accumulates across tool calls
     ctx.deps.schema_cache[table_name] = [col.model_dump() for col in columns]
+
+    if os.getenv("DEMO_LEVEL") == "2":
+        logger.info("[level2] schema context hydrated for table '%s'", table_name)
 
     return columns
 

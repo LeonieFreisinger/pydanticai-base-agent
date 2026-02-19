@@ -957,4 +957,4 @@ Think of `run()` as “just give me the final message” and `iter()` as “let 
 - [pydantic-ai Documentation](https://ai.pydantic.dev/)
 - [Langfuse Documentation](https://langfuse.com/docs)
 - [Chainlit Documentation](https://docs.chainlit.io/)
-- [Original "Building Agents at Dryft" Guide](./AGENTS.md)
+
